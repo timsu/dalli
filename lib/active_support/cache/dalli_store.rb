@@ -5,6 +5,9 @@ module ActiveSupport
   module Cache
     class DalliStore
 
+      class DalliNil
+      end
+
       attr_reader :silence, :options
       alias_method :silence?, :silence
 
@@ -57,7 +60,7 @@ module ActiveSupport
 
           if !entry.nil?
             instrument(:fetch_hit, name, options) { |payload| }
-            entry
+            entry == DalliNil ? nil : entry
           else
             result = instrument(:generate, name, options) do |payload|
               yield
@@ -77,7 +80,7 @@ module ActiveSupport
         instrument(:read, name, options) do |payload|
           entry = read_entry(name, options)
           payload[:hit] = !!entry if payload
-          entry
+          entry == DalliNil ? nil : entry
         end
       end
 
@@ -123,6 +126,8 @@ module ActiveSupport
                 memo[mapping[inner]] = entry.value
               rescue
               end
+            elsif entry == DalliNil
+              memo[mapping[inner]] = nil
             else
               memo[mapping[inner]] = entry
             end
@@ -212,6 +217,7 @@ module ActiveSupport
 
       # Write an entry to the cache.
       def write_entry(key, value, options) # :nodoc:
+        value = DalliNil if value.nil?
         method = options[:unless_exist] ? :add : :set
         expires_in = options[:expires_in]
         @data.send(method, escape(key), value, expires_in, options)

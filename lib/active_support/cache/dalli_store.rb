@@ -187,7 +187,15 @@ module ActiveSupport
       def read_entry(key, options) # :nodoc:
         entry = @data.get(escape(key), options)
         # NB Backwards data compatibility, to be removed at some point
-        entry.is_a?(ActiveSupport::Cache::Entry) ? entry.value : entry
+        if entry.is_a?(ActiveSupport::Cache::Entry)
+          begin
+            entry.value
+          rescue
+            nil
+          end
+        else
+          entry
+        end
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
         raise if @raise_errors

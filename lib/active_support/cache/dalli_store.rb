@@ -117,7 +117,15 @@ module ActiveSupport
           results.inject({}) do |memo, (inner, value)|
             entry = results[inner]
             # NB Backwards data compatibility, to be removed at some point
-            memo[mapping[inner]] = (entry.is_a?(ActiveSupport::Cache::Entry) ? entry.value : entry)
+
+            if entry.is_a?(ActiveSupport::Cache::Entry)
+              begin
+                memo[mapping[inner]] = entry.value
+              rescue
+              end
+            else
+              memo[mapping[inner]] = entry
+            end
             memo
           end
         end

@@ -42,8 +42,21 @@ module ActiveSupport
         @options = options.dup
         @options[:compress] ||= @options[:compression]
         @raise_errors = !!@options[:raise_errors]
-        addresses << 'localhost:11211' if addresses.empty?
-        @data = Dalli::Client.new(addresses, @options)
+        servers = if addresses.empty?
+                    nil # use the default from Dalli::Client
+                  else
+                    addresses
+                  end
+        @data = Dalli::Client.new(servers, @options)
+
+        extend Strategy::LocalCache
+      end
+
+      ##
+      # Access the underlying Dalli::Client instance for
+      # access to get_multi, etc.
+      def dalli
+        @data
       end
 
       def fetch(name, options=nil)
@@ -105,32 +118,44 @@ module ActiveSupport
         options ||= {}
         name = expanded_key name
 
-        log(:delete, name, options)
-        delete_entry(name, options)
+        instrument(:delete, name, options) do |payload|
+          delete_entry(name, options)
+        end
       end
 
       # Reads multiple keys from the cache using a single call to the
       # servers for all keys. Keys must be Strings.
       def read_multi(*names)
-        options = names.extract_options!
+        names.extract_options!
         names = names.flatten
-        mapping = names.inject({}) { |memo, name| memo[escape(expanded_key(name))] = name; memo }
+        mapping = names.inject({}) { |memo, name| memo[expanded_key(name)] = name; memo }
         instrument(:read_multi, names) do
-          results = @data.get_multi(mapping.keys)
-          results.inject({}) do |memo, (inner, value)|
+          results = {}
+          if local_cache
+            mapping.keys.each do |key|
+              if value = local_cache.read_entry(key, options)
+                results[key] = value
+              end
+            end
+          end
+
+          results.merge!(@data.get_multi(mapping.keys - results.keys))
+          results.inject({}) do |memo, (inner, _)|
             entry = results[inner]
             # NB Backwards data compatibility, to be removed at some point
 
             if entry.is_a?(ActiveSupport::Cache::Entry)
               begin
-                memo[mapping[inner]] = entry.value
+                value = entry.value
               rescue
               end
             elsif entry == DalliNil
-              memo[mapping[inner]] = nil
+              value = nil
             else
-              memo[mapping[inner]] = entry
+              value = entry
             end
+            memo[mapping[inner]] = value
+            local_cache.write_entry(inner, value, options) if local_cache
             memo
           end
         end
@@ -177,8 +202,9 @@ module ActiveSupport
       # Clear the entire cache on all memcached servers. This method should
       # be used with care when using a shared cache.
       def clear(options=nil)
-        log(:clear, nil, options)
-        @data.flush_all
+        instrument(:clear, 'flushing all keys') do
+          @data.flush_all
+        end
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
         raise if @raise_errors
@@ -194,11 +220,19 @@ module ActiveSupport
         @data.reset
       end
 
+      def logger
+        Dalli.logger
+      end
+
+      def logger=(new_logger)
+        Dalli.logger = new_logger
+      end
+
       protected
 
       # Read an entry from the cache.
       def read_entry(key, options) # :nodoc:
-        entry = @data.get(escape(key), options)
+        entry = @data.get(key, options)
         # NB Backwards data compatibility, to be removed at some point
         if entry.is_a?(ActiveSupport::Cache::Entry)
           begin
@@ -220,7 +254,7 @@ module ActiveSupport
         value = DalliNil if value.nil?
         method = options[:unless_exist] ? :add : :set
         expires_in = options[:expires_in]
-        @data.send(method, escape(key), value, expires_in, options)
+        @data.send(method, key, value, expires_in, options)
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
         raise if @raise_errors
@@ -229,7 +263,7 @@ module ActiveSupport
 
       # Delete an entry from the cache.
       def delete_entry(key, options) # :nodoc:
-        @data.delete(escape(key))
+        @data.delete(key)
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
         raise if @raise_errors
@@ -254,35 +288,25 @@ module ActiveSupport
           key = key.sort_by { |k,_| k.to_s }.collect{|k,v| "#{k}=#{v}"}
         end
 
-        key.to_param
-      end
-
-      def escape(key)
-        key = key.to_s.dup
-        key = key.force_encoding("BINARY") if key.respond_to?(:encode)
-        key = key.gsub(ESCAPE_KEY_CHARS){ |match| "%#{match.getbyte(0).to_s(16).upcase}" }
+        key = key.to_param
+        if key.respond_to? :force_encoding
+          key = key.dup
+          key.force_encoding('binary')
+        end
         key
       end
 
       def instrument(operation, key, options=nil)
         log(operation, key, options)
 
-        if ActiveSupport::Cache::Store.instrument
-          payload = { :key => key }
-          payload.merge!(options) if options.is_a?(Hash)
-          ActiveSupport::Notifications.instrument("cache_#{operation}.active_support", payload){ yield(payload) }
-        else
-          yield(nil)
-        end
+        payload = { :key => key }
+        payload.merge!(options) if options.is_a?(Hash)
+        ActiveSupport::Notifications.instrument("cache_#{operation}.active_support", payload){ yield(payload) }
       end
 
       def log(operation, key, options=nil)
         return unless logger && logger.debug? && !silence?
         logger.debug("Cache #{operation}: #{key}#{options.blank? ? "" : " (#{options.inspect})"}")
-      end
-
-      def logger
-        Dalli.logger
       end
 
     end

@@ -1,6 +1,5 @@
 require 'socket'
 require 'timeout'
-require 'zlib'
 
 module Dalli
   class Server
@@ -8,6 +7,7 @@ module Dalli
     attr_accessor :port
     attr_accessor :weight
     attr_accessor :options
+    attr_reader :sock
 
     DEFAULTS = {
       # seconds between trying to contact a remote server
@@ -20,6 +20,12 @@ module Dalli
       :socket_failure_delay => 0.01,
       # max size of value in bytes (default is 1 MB, can be overriden with "memcached -I <size>")
       :value_max_bytes => 1024 * 1024,
+      :compressor => Compressor,
+      # min byte size to attempt compression
+      :compression_min_size => 1024,
+      # max byte size for compression
+      :compression_max_size => false,
+      :serializer => Marshal,
       :username => nil,
       :password => nil,
       :keepalive => true
@@ -38,6 +44,7 @@ module Dalli
       @sock = nil
       @msg = nil
       @pid = nil
+      @inprogress = nil
     end
 
     # Chokepoint method for instrumentation
@@ -90,6 +97,95 @@ module Dalli
     end
 
     def unlock!
+    end
+
+    def serializer
+      @options[:serializer]
+    end
+
+    def compressor
+      @options[:compressor]
+    end
+
+    # Start reading key/value pairs from this connection. This is usually called
+    # after a series of GETKQ commands. A NOOP is sent, and the server begins
+    # flushing responses for kv pairs that were found.
+    #
+    # Returns nothing.
+    def multi_response_start
+      verify_state
+      write_noop
+      @multi_buffer = ''
+      @position = 0
+      @inprogress = true
+    end
+
+    # Did the last call to #multi_response_start complete successfully?
+    def multi_response_completed?
+      @multi_buffer.nil?
+    end
+
+    # Attempt to receive and parse as many key/value pairs as possible
+    # from this server. After #multi_response_start, this should be invoked
+    # repeatedly whenever this server's socket is readable until
+    # #multi_response_completed?.
+    #
+    # Returns a Hash of kv pairs received.
+    def multi_response_nonblock
+      raise 'multi_response has completed' if @multi_buffer.nil?
+
+      @multi_buffer << @sock.read_available
+      buf = @multi_buffer
+      pos = @position
+      values = {}
+
+      while buf.bytesize - pos >= 24
+        header = buf.slice(pos, 24)
+        (key_length, _, body_length) = header.unpack(KV_HEADER)
+
+        if key_length == 0
+          # all done!
+          @multi_buffer = nil
+          @position = nil
+          @inprogress = false
+          break
+
+        elsif buf.bytesize - pos >= 24 + body_length
+          flags = buf.slice(pos + 24, 4).unpack('N')[0]
+          key = buf.slice(pos + 24 + 4, key_length)
+          value = buf.slice(pos + 24 + 4 + key_length, body_length - key_length - 4) if body_length - key_length - 4 > 0
+
+          pos = pos + 24 + body_length
+
+          begin
+            values[key] = deserialize(value, flags)
+          rescue DalliError
+          end
+
+        else
+          # not enough data yet, wait for more
+          break
+        end
+      end
+      @position = pos
+
+      values
+    rescue SystemCallError, Timeout::Error, EOFError
+      failure!
+    end
+
+    # Abort an earlier #multi_response_start. Used to signal an external
+    # timeout. The underlying socket is disconnected, and the exception is
+    # swallowed.
+    #
+    # Returns nothing.
+    def multi_response_abort
+      @multi_buffer = nil
+      @position = nil
+      @inprogress = false
+      failure!
+    rescue NetworkError
+      true
     end
 
     # NOTE: Additional public methods should be overridden in Dalli::Threadsafe
@@ -163,24 +259,37 @@ module Dalli
     def set(key, value, ttl, cas, options)
       (value, flags) = serialize(key, value, options)
 
-      req = [REQUEST, OPCODES[multi? ? :setq : :set], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, cas, flags, ttl, key, value].pack(FORMAT[:set])
-      write(req)
-      generic_response unless multi?
+      if under_max_value_size?(value)
+        req = [REQUEST, OPCODES[multi? ? :setq : :set], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, cas, flags, ttl, key, value].pack(FORMAT[:set])
+        write(req)
+        generic_response unless multi?
+      else
+        false
+      end
     end
 
     def add(key, value, ttl, options)
       (value, flags) = serialize(key, value, options)
 
-      req = [REQUEST, OPCODES[multi? ? :addq : :add], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, 0, flags, ttl, key, value].pack(FORMAT[:add])
-      write(req)
-      generic_response unless multi?
+      if under_max_value_size?(value)
+        req = [REQUEST, OPCODES[multi? ? :addq : :add], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, 0, flags, ttl, key, value].pack(FORMAT[:add])
+        write(req)
+        generic_response unless multi?
+      else
+        false
+      end
     end
 
     def replace(key, value, ttl, options)
       (value, flags) = serialize(key, value, options)
-      req = [REQUEST, OPCODES[multi? ? :replaceq : :replace], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, 0, flags, ttl, key, value].pack(FORMAT[:replace])
-      write(req)
-      generic_response unless multi?
+
+      if under_max_value_size?(value)
+        req = [REQUEST, OPCODES[multi? ? :replaceq : :replace], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, 0, flags, ttl, key, value].pack(FORMAT[:replace])
+        write(req)
+        generic_response unless multi?
+      else
+        false
+      end
     end
 
     def delete(key)
@@ -217,11 +326,15 @@ module Dalli
       body ? longlong(*body.unpack('NN')) : body
     end
 
+    def write_noop
+      req = [REQUEST, OPCODES[:noop], 0, 0, 0, 0, 0, 0, 0].pack(FORMAT[:noop])
+      write(req)
+    end
+
     # Noop is a keepalive operation but also used to demarcate the end of a set of pipelined commands.
     # We need to read all the responses at once.
     def noop
-      req = [REQUEST, OPCODES[:noop], 0, 0, 0, 0, 0, 0, 0].pack(FORMAT[:noop])
-      write(req)
+      write_noop
       multi_response
     end
 
@@ -267,12 +380,10 @@ module Dalli
       generic_response
     end
 
-    COMPRESSION_MIN_SIZE = 1024
-
     # http://www.hjp.at/zettel/m/memcached_flags.rxml
     # Looks like most clients use bit 0 to indicate native language serialization
     # and bit 1 to indicate gzip compression.
-    FLAG_MARSHALLED = 0x1
+    FLAG_SERIALIZED = 0x1
     FLAG_COMPRESSED = 0x2
 
     def serialize(key, value, options=nil)
@@ -280,7 +391,7 @@ module Dalli
       value = unless options && options[:raw]
         marshalled = true
         begin
-          Marshal.dump(value)
+          self.serializer.dump(value)
         rescue => ex
           # Marshalling can throw several different types of generic Ruby exceptions.
           # Convert to a specific exception so we can special case it higher up the stack.
@@ -292,31 +403,36 @@ module Dalli
         value.to_s
       end
       compressed = false
-      if @options[:compress] && value.bytesize >= COMPRESSION_MIN_SIZE
-        value = Zlib::Deflate.deflate(value)
+      if @options[:compress] && value.bytesize >= @options[:compression_min_size] &&
+        (!@options[:compression_max_size] || value.bytesize <= @options[:compression_max_size])
+        value = self.compressor.compress(value)
         compressed = true
       end
-      raise Dalli::DalliError, "Value too large, memcached can only store #{@options[:value_max_bytes]} bytes per key [key: #{key}, size: #{value.bytesize}]" if value.bytesize > @options[:value_max_bytes]
+
       flags = 0
       flags |= FLAG_COMPRESSED if compressed
-      flags |= FLAG_MARSHALLED if marshalled
+      flags |= FLAG_SERIALIZED if marshalled
       [value, flags]
     end
 
     def deserialize(value, flags)
-      value = Zlib::Inflate.inflate(value) if (flags & FLAG_COMPRESSED) != 0
-      value = Marshal.load(value) if (flags & FLAG_MARSHALLED) != 0
+      value = self.compressor.decompress(value) if (flags & FLAG_COMPRESSED) != 0
+      value = self.serializer.load(value) if (flags & FLAG_SERIALIZED) != 0
       value
-    rescue TypeError, ArgumentError
-      raise DalliError, "Unable to unmarshal value: #{$!.message}"
+    rescue TypeError
+      raise if $!.message !~ /needs to have method `_load'|exception class\/object expected|instance of IO needed|incompatible marshal file format/
+      raise UnmarshalError, "Unable to unmarshal value: #{$!.message}"
+    rescue ArgumentError
+      raise if $!.message !~ /undefined class|marshal data too short/
+      raise UnmarshalError, "Unable to unmarshal value: #{$!.message}"
     rescue Zlib::Error
-      raise DalliError, "Unable to uncompress value: #{$!.message}"
+      raise UnmarshalError, "Unable to uncompress value: #{$!.message}"
     end
 
     def cas_response
       header = read(24)
       raise Dalli::NetworkError, 'No response' if !header
-      (extras, type, status, count, _, cas) = header.unpack(CAS_HEADER)
+      (extras, _, status, count, _, cas) = header.unpack(CAS_HEADER)
       data = read(count) if count > 0
       if status == 1
         nil
@@ -334,10 +450,14 @@ module Dalli
     NORMAL_HEADER = '@4CCnN'
     KV_HEADER = '@2n@6nN'
 
+    def under_max_value_size?(value)
+      value.bytesize <= @options[:value_max_bytes]
+    end
+
     def generic_response(unpack=false)
       header = read(24)
       raise Dalli::NetworkError, 'No response' if !header
-      (extras, type, status, count) = header.unpack(NORMAL_HEADER)
+      (extras, _, status, count) = header.unpack(NORMAL_HEADER)
       data = read(count) if count > 0
       if status == 1
         nil
@@ -359,7 +479,7 @@ module Dalli
       loop do
         header = read(24)
         raise Dalli::NetworkError, 'No response' if !header
-        (key_length, status, body_length) = header.unpack(KV_HEADER)
+        (key_length, _, body_length) = header.unpack(KV_HEADER)
         return hash if key_length == 0
         key = read(key_length)
         value = read(body_length - key_length) if body_length - key_length > 0
@@ -372,7 +492,7 @@ module Dalli
       loop do
         header = read(24)
         raise Dalli::NetworkError, 'No response' if !header
-        (key_length, status, body_length) = header.unpack(KV_HEADER)
+        (key_length, _, body_length) = header.unpack(KV_HEADER)
         return hash if key_length == 0
         flags = read(4).unpack('N')[0]
         key = read(key_length)
@@ -408,7 +528,7 @@ module Dalli
 
       begin
         @pid = Process.pid
-        @sock = KSocket.open(hostname, port, options)
+        @sock = KSocket.open(hostname, port, self, options)
         @version = version # trigger actual connect
         sasl_authentication if need_auth?
         up!

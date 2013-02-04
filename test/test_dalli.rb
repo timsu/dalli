@@ -19,7 +19,7 @@ describe 'Dalli' do
       bad_data = [{:bad => 'expires in data'}, Hash, [1,2,3]]
       bad_data.each do |bad|
         assert_raises ArgumentError do
-          dc = Dalli::Client.new('foo', {:expires_in => bad})
+          Dalli::Client.new('foo', {:expires_in => bad})
         end
       end
     end
@@ -27,18 +27,19 @@ describe 'Dalli' do
 
   describe 'key validation' do
     should 'not allow blanks' do
-      dc = Dalli::Client.new
-      dc.set '   ', 1
-      assert_equal 1, dc.get('   ')
-      dc.set "\t", 1
-      assert_equal 1, dc.get("\t")
-      dc.set "\n", 1
-      assert_equal 1, dc.get("\n")
-      assert_raises ArgumentError do
-        dc.set "", 1
-      end
-      assert_raises ArgumentError do
-        dc.set nil, 1
+      memcached do |dc|
+        dc.set '   ', 1
+        assert_equal 1, dc.get('   ')
+        dc.set "\t", 1
+        assert_equal 1, dc.get("\t")
+        dc.set "\n", 1
+        assert_equal 1, dc.get("\n")
+        assert_raises ArgumentError do
+          dc.set "", 1
+        end
+        assert_raises ArgumentError do
+          dc.set nil, 1
+        end
       end
     end
   end
@@ -66,6 +67,24 @@ describe 'Dalli' do
     assert_equal s2, s3
   end
 
+  should "accept comma separated string" do
+    dc = Dalli::Client.new("server1.example.com:11211,server2.example.com:11211")
+    ring = dc.send(:ring)
+    assert_equal 2, ring.servers.size
+    s1,s2 = ring.servers.map(&:hostname)
+    assert_equal "server1.example.com", s1
+    assert_equal "server2.example.com", s2
+  end
+
+  should "accept array of servers" do
+    dc = Dalli::Client.new(["server1.example.com:11211","server2.example.com:11211"])
+    ring = dc.send(:ring)
+    assert_equal 2, ring.servers.size
+    s1,s2 = ring.servers.map(&:hostname)
+    assert_equal "server1.example.com", s1
+    assert_equal "server2.example.com", s2
+  end
+
   context 'using a live server' do
 
     should "support get/set" do
@@ -73,11 +92,7 @@ describe 'Dalli' do
         dc.flush
 
         val1 = "1234567890"*105000
-        assert_error Dalli::DalliError, /too large/ do
-          dc.set('a', val1)
-          val2 = dc.get('a')
-          assert_equal val1, val2
-        end
+        assert_equal false, dc.set('a', val1)
 
         val1 = "1234567890"*100000
         dc.set('a', val1)
@@ -187,18 +202,18 @@ describe 'Dalli' do
         resp = dc.get_multi(%w(a b c d e f))
         assert_equal({ 'a' => 'foo', 'b' => 123, 'c' => %w(a b c) }, resp)
 
-        # Perform a huge multi-get with 10,000 elements.
+        # Perform a big multi-get with 1000 elements.
         arr = []
         dc.multi do
-          10_000.times do |idx|
+          1000.times do |idx|
             dc.set idx, idx
             arr << idx
           end
         end
 
         result = dc.get_multi(arr)
-        assert_equal(10_000, result.size)
-        assert_equal(1000, result['1000'])
+        assert_equal(1000, result.size)
+        assert_equal(50, result['50'])
       end
     end
 
@@ -275,14 +290,14 @@ describe 'Dalli' do
 
         # rollover the 64-bit value, we'll get something undefined.
         resp = dc.incr('big', 1)
-        0x10000000000000000.wont_equal resp
+        refute_equal 0x10000000000000000, resp
         dc.reset
       end
     end
 
     should 'support the append and prepend operations' do
       memcached do |dc|
-        resp = dc.flush
+        dc.flush
         assert_equal true, dc.set('456', 'xyz', 0, :raw => true)
         assert_equal true, dc.prepend('456', '0')
         assert_equal true, dc.append('456', '9')
@@ -297,7 +312,7 @@ describe 'Dalli' do
     should 'support touch operation' do
       memcached do |dc|
         begin
-          resp = dc.flush
+          dc.flush
           dc.set 'key', 'value'
           assert_equal true, dc.touch('key', 10)
           assert_equal true, dc.touch('key')
@@ -327,7 +342,7 @@ describe 'Dalli' do
     should "pass a simple smoke test" do
       memcached do |dc|
         resp = dc.flush
-        resp.wont_be_nil
+        refute_nil resp
         assert_equal [true, true], resp
 
         assert_equal true, dc.set(:foo, 'bar')
@@ -348,7 +363,7 @@ describe 'Dalli' do
         dc.prepend('123', '0')
         dc.append('123', '0')
 
-        assert_raises Dalli::DalliError do
+        assert_raises Dalli::UnmarshalError do
           resp = dc.get('123')
         end
 
@@ -403,15 +418,19 @@ describe 'Dalli' do
               cache.set('b', 11)
               inc = cache.incr('cat', 10, 0, 10)
               cache.set('f', 'zzz')
-              wont_be_nil(cache.cas('f') do |value|
+              res = cache.cas('f') do |value|
                 value << 'z'
-              end)
+              end
+              refute_nil res
               assert_equal false, cache.add('a', 11)
               assert_equal({ 'a' => 9, 'b' => 11 }, cache.get_multi(['a', 'b']))
               inc = cache.incr('cat', 10)
               assert_equal 0, inc % 5
-              dec = cache.decr('cat', 5)
+              cache.decr('cat', 5)
               assert_equal 11, cache.get('b')
+
+              assert_equal %w(a b), cache.get_multi('a', 'b', 'c').keys.sort
+
             end
           end
         end
@@ -469,9 +488,7 @@ describe 'Dalli' do
           dalli = Dalli::Client.new(dc.instance_variable_get(:@servers), :compress => true)
 
           value = "0"*1024*1024
-          assert_raises Dalli::DalliError, /too large/ do
-            dc.set('verylarge', value)
-          end
+          assert_equal false, dc.set('verylarge', value)
           dalli.set('verylarge', value)
         end
       end

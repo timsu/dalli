@@ -1,4 +1,5 @@
 require 'digest/md5'
+require 'set'
 
 # encoding: ascii
 module Dalli
@@ -20,13 +21,26 @@ module Dalli
     # - :failover - if a server is down, look for and store values on another server in the ring.  Default: true.
     # - :threadsafe - ensure that only one thread is actively using a socket at a time. Default: true.
     # - :expires_in - default TTL in seconds if you do not pass TTL as a parameter to an individual operation, defaults to 0 or forever
-    # - :compress - defaults to false, if true Dalli will compress values larger than 100 bytes before
+    # - :compress - defaults to false, if true Dalli will compress values larger than 1024 bytes before
+    # - :serializer - defaults to Marshal
     #   sending them to memcached.
+    # - :compressor - defaults to zlib
     #
     def initialize(servers=nil, options={})
-      @servers = servers || env_servers || '127.0.0.1:11211'
+      @servers = normalize_servers(servers || ENV["MEMCACHE_SERVERS"] || '127.0.0.1:11211')
       @options = normalize_options(options)
       @ring = nil
+    end
+
+    ##
+    # Normalizes the argument into an array of servers. If the argument is a string, it's expected to be of
+    # the format "memcache1.example.com:11211[,memcache2.example.com:11211[,memcache3.example.com:11211[...]]]
+    def normalize_servers(servers)
+      if servers.is_a? String
+        return servers.split(",")
+      else
+        return servers
+      end
     end
 
     #
@@ -58,28 +72,79 @@ module Dalli
       options = nil
       options = keys.pop if keys.last.is_a?(Hash) || keys.last.nil?
       ring.lock do
-        keys.flatten.each do |key|
-          begin
-            perform(:getkq, key)
-          rescue DalliError, NetworkError => e
-            Dalli.logger.debug { e.message }
-            Dalli.logger.debug { "unable to get key #{key}" }
-          end
-        end
+        begin
+          servers = self.servers_in_use = Set.new
 
-        values = {}
-        ring.servers.each do |server|
-          next unless server.alive?
-          begin
-            server.request(:noop).each_pair do |key, value|
-              values[key_without_namespace(key)] = value
+          keys.flatten.each do |key|
+            begin
+              perform(:getkq, key)
+            rescue DalliError, NetworkError => e
+              Dalli.logger.debug { e.inspect }
+              Dalli.logger.debug { "unable to get key #{key}" }
             end
-          rescue DalliError, NetworkError => e
-            Dalli.logger.debug { e.message }
-            Dalli.logger.debug { "results from this server will be missing" }
           end
+
+          values = {}
+          return values if servers.empty?
+
+          servers.each do |server|
+            next unless server.alive?
+            begin
+              server.multi_response_start
+            rescue DalliError, NetworkError => e
+              Dalli.logger.debug { e.inspect }
+              Dalli.logger.debug { "results from this server will be missing" }
+              servers.delete(server)
+            end
+          end
+
+          start = Time.now
+          loop do
+            # remove any dead servers
+            servers.delete_if { |s| s.sock.nil? }
+            break if servers.empty?
+
+            # calculate remaining timeout
+            elapsed = Time.now - start
+            timeout = servers.first.options[:socket_timeout]
+            if elapsed > timeout
+              readable = nil
+            else
+              sockets = servers.map(&:sock)
+              readable, _ = IO.select(sockets, nil, nil, timeout - elapsed)
+            end
+
+            if readable.nil?
+              # no response within timeout; abort pending connections
+              servers.each do |server|
+                puts "Abort!"
+                server.multi_response_abort
+              end
+              break
+
+            else
+              readable.each do |sock|
+                server = sock.server
+
+                begin
+                  server.multi_response_nonblock.each do |key, value|
+                    values[key_without_namespace(key)] = value
+                  end
+
+                  if server.multi_response_completed?
+                    servers.delete(server)
+                  end
+                rescue NetworkError
+                  servers.delete(server)
+                end
+              end
+            end
+          end
+
+          values
+        ensure
+          self.servers_in_use = nil
         end
-        values
       end
     end
 
@@ -241,7 +306,7 @@ module Dalli
 
     def ring
       @ring ||= Dalli::Ring.new(
-        Array(@servers).map do |s|
+        @servers.map do |s|
          server_options = {}
           if s =~ %r{\Amemcached://}
             uri = URI.parse(s)
@@ -254,41 +319,50 @@ module Dalli
       )
     end
 
-    def env_servers
-      ENV['MEMCACHE_SERVERS'] ? ENV['MEMCACHE_SERVERS'].split(',') : nil
-    end
-
     # Chokepoint method for instrumentation
     def perform(op, key, *args)
       key = key.to_s
       key = validate_key(key)
       begin
         server = ring.server_for_key(key)
-        server.request(op, key, *args)
+        ret = server.request(op, key, *args)
+        servers_in_use << server if servers_in_use
+        ret
       rescue NetworkError => e
-        Dalli.logger.debug { e.message }
+        Dalli.logger.debug { e.inspect }
         Dalli.logger.debug { "retrying request with new server" }
         retry
       end
+    end
+
+    def servers_in_use
+      Thread.current[:"#{object_id}-servers"]
+    end
+
+    def servers_in_use=(value)
+      Thread.current[:"#{object_id}-servers"] = value
     end
 
     def validate_key(key)
       raise ArgumentError, "key cannot be blank" if !key || key.length == 0
       key = key_with_namespace(key)
       if key.length > 250
-        namespace_length = @options[:namespace] ? @options[:namespace].size : 0
-        max_length_before_namespace = 212 - namespace_length
+        max_length_before_namespace = 212 - (namespace || '').size
         key = "#{key[0, max_length_before_namespace]}:md5:#{Digest::MD5.hexdigest(key)}"
       end
       return key
     end
 
     def key_with_namespace(key)
-      @options[:namespace] ? "#{@options[:namespace]}:#{key}" : key
+      (ns = namespace) ? "#{ns}:#{key}" : key
     end
 
     def key_without_namespace(key)
-      @options[:namespace] ? key.sub(%r(\A#{@options[:namespace]}:), '') : key
+      (ns = namespace) ? key.sub(%r(\A#{ns}:), '') : key
+    end
+
+    def namespace
+      @options[:namespace].is_a?(Proc) ? @options[:namespace].call : @options[:namespace]
     end
 
     def normalize_options(opts)

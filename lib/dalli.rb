@@ -1,3 +1,4 @@
+require 'dalli/compressor'
 require 'dalli/client'
 require 'dalli/ring'
 require 'dalli/server'
@@ -13,8 +14,10 @@ module Dalli
   class NetworkError < DalliError; end
   # no server available/alive error
   class RingError < DalliError; end
-  # application error in marshalling
+  # application error in marshalling serialization
   class MarshalError < DalliError; end
+  # application error in marshalling deserialization or decompression
+  class UnmarshalError < DalliError; end
 
   def self.logger
     @logger ||= (rails_logger || default_logger)
@@ -35,6 +38,7 @@ module Dalli
   def self.logger=(logger)
     @logger = logger
   end
+
 end
 
 if defined?(RAILS_VERSION) && RAILS_VERSION < '3'

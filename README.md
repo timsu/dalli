@@ -55,12 +55,14 @@ On Ubuntu you can install it by running:
 
 You can verify your installation using this piece of code:
 
-    gem install dalli
+```ruby
+gem install dalli
 
-    require 'dalli'
-    dc = Dalli::Client.new('localhost:11211')
-    dc.set('abc', 123)
-    value = dc.get('abc')
+require 'dalli'
+dc = Dalli::Client.new('localhost:11211')
+dc.set('abc', 123)
+value = dc.get('abc')
+```
 
 The test suite requires memcached 1.4.3+ with SASL enabled (brew install memcached --enable-sasl ; mv /usr/bin/memcached /usr/bin/memcached.old).  Currently only supports the PLAIN mechanism.
 
@@ -73,20 +75,37 @@ Usage with Rails 3.x
 
 In your Gemfile:
 
-    gem 'dalli'
+```ruby
+gem 'dalli'
+```
 
 In `config/environments/production.rb`:
 
-    config.cache_store = :dalli_store
+```ruby
+config.cache_store = :dalli_store
+```
 
 Here's a more comprehensive example that sets a reasonable default for maximum cache entry lifetime (one day), enables compression for large values and namespaces all entries for this rails app.  Remove the namespace if you have multiple apps which share cached values.
 
-    config.cache_store = :dalli_store, 'cache-1.example.com', 'cache-2.example.com',
-        { :namespace => NAME_OF_RAILS_APP, :expires_in => 1.day, :compress => true }
+```ruby
+config.cache_store = :dalli_store, 'cache-1.example.com', 'cache-2.example.com',
+  { :namespace => NAME_OF_RAILS_APP, :expires_in => 1.day, :compress => true }
+```
 
 To use Dalli for Rails session storage that times out after 20 minutes, in `config/initializers/session_store.rb`:
 
-    Rails.application.config.session_store ActionDispatch::Session::CacheStore, :expire_after => 20.minutes
+For Rails >= 3.2.4:
+
+```ruby
+Rails.application.config.session_store ActionDispatch::Session::CacheStore, :expire_after => 20.minutes
+```
+
+For Rails 3.x:
+
+```ruby
+require 'action_dispatch/middleware/session/dalli_store'
+Rails.application.config.session_store :dalli_store, :memcache_server => ['host1', 'host2'], :namespace => 'sessions', :key => '_foundation_session', :expire_after => 20.minutes
+```
 
 Dalli does not support Rails 2.x.
 
@@ -100,6 +119,13 @@ Dalli::Client accepts the following options. All times are in seconds.
 **failover**: Boolean, if true Dalli will failover to another server if the main server for a key is down.
 
 **compress**: Boolean, if true Dalli will gzip-compress values larger than 1K.
+
+**compression_min_size**: Minimum value byte size for which to attempt compression. Default is 1K.
+
+**compression_max_size**: Maximum value byte size for which to attempt compression. Default is unlimited.
+
+**serializer**: The serializer to use for objects being stored (ex. JSON).
+Default is Marshal.
 
 **socket_timeout**: Timeout for all socket operations (connect, read, write). Default is 0.5.
 
@@ -117,6 +143,10 @@ Dalli::Client accepts the following options. All times are in seconds.
 
 **keepalive**: Boolean, if true Dalli will enable keep-alives on the socket so inactivity
 
+**compressor**: The compressor to use for objects being stored.
+Default is zlib, implemented under `Dalli::Compressor`.
+If serving compressed data using nginx's HttpMemcachedModule, set `memcached_gzip_flag 2` and use `Dalli::GzipCompressor`
+
 Features and Changes
 ------------------------
 
@@ -128,6 +158,7 @@ socket.
 
 Note that Dalli does not require ActiveSupport or Rails.  You can safely use it in your own Ruby projects.
 
+![View the API](http://www.ruby-doc.org/gems/docs/d/dalli-2.5.0/Dalli/Client.html)
 
 Helping Out
 -------------

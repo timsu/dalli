@@ -1,9 +1,69 @@
 Dalli Changelog
 =====================
 
-unreleased
+HEAD
 =======
 
+- Fix 'can't modify frozen String' errors in `ActiveSupport::Cache::DalliStore` [dblock]
+
+2.6.2
+=======
+
+- Properly handle missing RubyInline
+
+2.6.1
+=======
+
+- Add optional native C binary search for ring, add:
+
+gem 'RubyInline'
+
+  to your Gemfile to get a 10% speedup when using many servers.
+  You will see no improvement if you are only using one server.
+
+- More get_multi performance optimization [xaop, #315]
+- Add lambda support for cache namespaces [joshwlewis, #311]
+
+2.6.0
+=======
+
+- read_multi optimization, now checks local_cache [chendo, #306]
+- Re-implement get_multi to be non-blocking [tmm1, #295]
+- Add `dalli` accessor to dalli_store to access the underlying
+Dalli::Client, for things like `get_multi`.
+- Add `Dalli::GzipCompressor`, primarily for compatibility with nginx's HttpMemcachedModule using `memcached_gzip_flag`
+
+2.5.0
+=======
+
+- Don't escape non-ASCII keys, memcached binary protocol doesn't care. [#257]
+- :dalli_store now implements LocalCache [#236]
+- Removed lots of old session_store test code, tests now all run without a default memcached server [#275]
+- Changed Dalli ActiveSupport adapter to always attempt instrumentation [brianmario, #284]
+- Change write operations (add/set/replace) to return false when value is too large to store [brianmario, #283]
+- Allowing different compressors per client [naseem]
+
+2.4.0
+=======
+- Added the ability to swap out the compressed used to [de]compress cache data [brianmario, #276]
+- Fix get\_multi performance issues with lots of memcached servers [tmm1]
+- Throw more specific exceptions [tmm1]
+- Allowing different types of serialization per client [naseem]
+
+2.3.0
+=======
+- Added the ability to swap out the serializer used to [de]serialize cache data [brianmario, #274]
+
+2.2.1
+=======
+
+- Fix issues with ENV-based connections. [#266]
+- Fix problem with SessionStore in Rails 4.0 [#265]
+
+2.2.0
+=======
+
+- Add Rack session with\_lock helper, for Rails 4.0 support [#264]
 - Accept connection string in the form of a URL (e.g., memcached://user:pass@hostname:port) [glenngillen]
 - Add touch operation [#228, uzzz]
 
